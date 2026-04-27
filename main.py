@@ -15,64 +15,64 @@ async def root():
 @app.post("/api/download")
 async def download_media(request: URLRequest):
     url = request.url
-    
-    # Path to cookies file (explained in Step 2)
     cookie_path = "cookies.txt"
     
     ydl_opts = {
         'quiet': True,
         'no_warnings': True,
-        'format': 'best',
-        # Bypass blocks with headers
+        # SET QUALITY TO 720P: This looks for the best video up to 720p + best audio
+        'format': 'bestvideo[height<=720]+bestaudio/best[height<=720]',
+        
+        # BYPASS 403: Mimic a real Chrome browser on Windows
+        'impersonate': 'chrome', 
+        
         'http_headers': {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
-            'Accept': '*/*',
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
             'Accept-Language': 'en-US,en;q=0.5',
-            'Origin': 'https://www.instagram.com',
-            'Referer': 'https://www.instagram.com/',
+            'Referer': 'https://www.tiktok.com/',
         }
     }
 
-    # If you uploaded a cookies.txt, use it automatically
     if os.path.exists(cookie_path):
         ydl_opts['cookiefile'] = cookie_path
 
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            # Extract info
             info = ydl.extract_info(url, download=False)
             
-            # 1. Get the Best Video URL
-            video_url = info.get('url')
-            
-            # 2. Extract the Best Audio URL (MP3)
-            # We look for the best quality audio-only stream
-            formats = info.get('formats', [])
-            audio_url = None
-            
-            # Filter for audio-only streams
-            audio_streams = [f for f in formats if f.get('vcodec') == 'none' and f.get('acodec') != 'none']
-            if audio_streams:
-                # Sort by bitrate to get best quality
-                best_audio = sorted(audio_streams, key=lambda x: x.get('abr', 0), reverse=True)[0]
-                audio_url = best_audio.get('url')
-            else:
-                # Fallback to the main URL if no separate audio found
-                audio_url = video_url
-
-            return {
-                "success": True,
-                "data": {
-                    "title": info.get('title', 'Media'),
-                    "platform": info.get('extractor_key'),
-                    "thumbnail": info.get('thumbnail'),
-                    "video_url": video_url,
-                    "audio_url": audio_url
+            # Format the response
+            response_data = {
+                "title": info.get('title', 'Media'),
+                "platform": info.get('extractor_key'),
+                "thumbnail": info.get('thumbnail'),
+                "duration": info.get('duration'),
+                "media": {
+                    "video_url_720p": None,
+                    "audio_mp3_url": None
                 }
             }
 
+            # Get the direct Video link
+            response_data["media"]["video_url_720p"] = info.get('url')
+
+            # Extract the best Audio-only link (MP3)
+            formats = info.get('formats', [])
+            audio_streams = [f for f in formats if f.get('vcodec') == 'none' and f.get('acodec') != 'none']
+            
+            if audio_streams:
+                # Sort by quality/bitrate
+                best_audio = sorted(audio_streams, key=lambda x: x.get('abr', 0), reverse=True)[0]
+                response_data["media"]["audio_mp3_url"] = best_audio.get('url')
+            else:
+                # Fallback if no separate audio stream is found
+                response_data["media"]["audio_mp3_url"] = info.get('url')
+
+            return {"success": True, "data": response_data}
+
     except Exception as e:
-        # Better error reporting
-        error_str = str(e)
-        if "login" in error_str.lower() or "empty media" in error_str.lower():
-            raise HTTPException(status_code=403, detail="Instagram login required. Please update cookies.txt.")
-        raise HTTPException(status_code=400, detail=error_str)
+        error_msg = str(e)
+        if "403" in error_msg or "Forbidden" in error_msg:
+            raise HTTPException(status_code=403, detail="TikTok/Instagram blocked the server IP. Try using cookies.txt or a proxy.")
+        raise HTTPException(status_code=400, detail=error_msg)
