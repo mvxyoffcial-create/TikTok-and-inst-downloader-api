@@ -2,37 +2,52 @@ import asyncio
 import os
 import tempfile
 import subprocess
-from typing import Dict, Any
+from typing import Dict, Any, Optional
 from urllib.parse import quote
 
 from fastapi import FastAPI, Query, HTTPException, Request
-from fastapi.responses import JSONResponse, FileResponse
+from fastapi.responses import JSONResponse, StreamingResponse, FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.background import BackgroundTask
 import yt_dlp
+import httpx
 import uvicorn
 
-app = FastAPI(title="TikTok & Instagram Downloader – Single Endpoint")
+app = FastAPI(title="TikTok & Instagram Downloader – Fixed")
 
-# ✅ Enable CORS for all origins (adjust as needed)
+# CORS – adjust in production
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],          # Allows all origins
+    allow_origins=["*"],
     allow_credentials=True,
-    allow_methods=["*"],          # Allows all methods (GET, POST, etc.)
-    allow_headers=["*"],          # Allows all headers
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
-# ---------- Helper functions (unchanged) ----------
+# ── Cookie loading ──────────────────────────────
+def get_cookie_path() -> Optional[str]:
+    """Return the path to the cookies.txt file if it exists."""
+    # You can also use an environment variable: return os.getenv('COOKIE_TXT', 'cookies.txt')
+    if os.path.exists('cookies.txt'):
+        return 'cookies.txt'
+    return None
+
+# ── yt-dlp helpers ──────────────────────────────
 def extract_info(url: str) -> Dict[str, Any]:
     ydl_opts = {
         'quiet': True,
         'no_warnings': True,
         'extract_flat': False,
-        # 'cookiefile': 'cookies.txt',  # if needed
+        # Add cookies if available
+        'cookiefile': get_cookie_path(),
+        # Use a common User-Agent to mimic a browser
+        'http_headers': {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        },
     }
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         return ydl.extract_info(url, download=False)
+
 
 def select_best_formats(info: dict, preferred_height: int = 720) -> tuple:
     thumbnail = info.get('thumbnail')
@@ -51,6 +66,7 @@ def select_best_formats(info: dict, preferred_height: int = 720) -> tuple:
         elif f.get('acodec') != 'none':
             audio_only.append(f)
 
+    # Combined stream closest to preferred height
     best_combined = None
     if combined:
         combined.sort(key=lambda f: (
@@ -80,12 +96,29 @@ def select_best_formats(info: dict, preferred_height: int = 720) -> tuple:
 
     return video_url, audio_url, thumbnail
 
-def convert_to_mp3(input_url: str) -> str:
+
+async def proxy_file(url: str, referer: str, media_type: str):
+    """Stream a file from an upstream URL with proper headers, bypassing CDN blocks."""
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Referer': referer,
+    }
+    async with httpx.AsyncClient(timeout=30) as client:
+        async with client.stream('GET', url, headers=headers) as upstream:
+            async def stream():
+                async for chunk in upstream.aiter_bytes():
+                    yield chunk
+            return StreamingResponse(stream(), media_type=media_type)
+
+# ── MP3 conversion ──────────────────────────────
+def convert_to_mp3(input_url: str, referer: str) -> str:
     tmp_mp3 = tempfile.NamedTemporaryFile(suffix=".mp3", delete=False)
     tmp_mp3.close()
     try:
         subprocess.run([
-            "ffmpeg", "-y", "-i", input_url,
+            "ffmpeg", "-y",
+            "-headers", f"Referer: {referer}",
+            "-i", input_url,
             "-codec:a", "libmp3lame", "-qscale:a", "2",
             tmp_mp3.name
         ], check=True, capture_output=True)
@@ -95,7 +128,8 @@ def convert_to_mp3(input_url: str) -> str:
             os.unlink(tmp_mp3.name)
         raise RuntimeError(f"FFmpeg conversion failed: {e.stderr.decode()}") from e
 
-# ---------- Endpoints ----------
+
+# ── Endpoint 1: Get all info + proxy links ─────
 @app.get("/download")
 async def get_everything(
     request: Request,
@@ -110,26 +144,31 @@ async def get_everything(
 
     video_url, audio_url, thumbnail = select_best_formats(info, preferred_height=quality)
 
-    # Build absolute MP3 download URL
-    mp3_url = None
-    if audio_url:
-        base = str(request.base_url).rstrip("/")
-        mp3_url = f"{base}/download-audio?url={quote(url, safe='')}&quality={quality}"
-
-    # Handle carousels – use first media
+    # Handle Instagram carousels (multi-image) – return first entry
     if info.get('_type') == 'playlist' and 'entries' in info:
         info = info['entries'][0]
 
+    platform = info.get('extractor_key', 'unknown')
+    referer = f"https://www.{platform}.com/"
+
+    # Build proxied download links (hide raw CDN URLs)
+    base = str(request.base_url).rstrip("/")
+    proxy_video_url = f"{base}/proxy-video?url={quote(video_url)}&referer={quote(referer)}" if video_url else None
+    proxy_audio_url = None
+    if audio_url:
+        proxy_audio_url = f"{base}/proxy-audio?url={quote(audio_url)}&referer={quote(referer)}&quality={quality}&original_url={quote(url)}"
+
     response = {
         "success": True,
-        "platform": info.get('extractor_key', 'unknown'),
+        "platform": platform,
         "title": info.get('title'),
         "description": info.get('description'),
         "uploader": info.get('uploader'),
         "duration": info.get('duration'),
         "thumbnail": thumbnail,
-        "video_url": video_url,
-        "mp3_url": mp3_url,
+        # These links will work because they stream through YOUR server with proper headers
+        "video_url": proxy_video_url,
+        "mp3_url": proxy_audio_url,
         "formats_available": [
             {
                 "format_id": f.get("format_id"),
@@ -144,23 +183,27 @@ async def get_everything(
     }
     return JSONResponse(content=response)
 
-@app.get("/download-audio")
-async def serve_mp3(
+
+# ── Endpoint 2: Proxy video download ──────────
+@app.get("/proxy-video")
+async def proxy_video(
     url: str = Query(...),
-    quality: int = Query(720)
+    referer: str = Query(...)
+):
+    return await proxy_file(url, referer, "video/mp4")
+
+
+# ── Endpoint 3: Proxy audio download (MP3) ────
+@app.get("/proxy-audio")
+async def proxy_audio(
+    url: str = Query(...),
+    referer: str = Query(...),
+    quality: int = Query(720),
+    original_url: str = Query(...)
 ):
     try:
         loop = asyncio.get_event_loop()
-        info = await loop.run_in_executor(None, extract_info, url)
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Failed to extract info: {str(e)}")
-
-    _, audio_url, _ = select_best_formats(info, preferred_height=quality)
-    if not audio_url:
-        raise HTTPException(status_code=404, detail="No audio stream found.")
-
-    try:
-        mp3_path = await loop.run_in_executor(None, convert_to_mp3, audio_url)
+        mp3_path = await loop.run_in_executor(None, convert_to_mp3, url, referer)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -171,9 +214,10 @@ async def serve_mp3(
     return FileResponse(
         mp3_path,
         media_type="audio/mpeg",
-        filename=f"{info.get('title', 'audio')}.mp3",
+        filename=f"audio.mp3",
         background=BackgroundTask(cleanup)
     )
+
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", 8000)))
