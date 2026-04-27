@@ -1,67 +1,78 @@
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 import yt_dlp
+import os
 
 app = FastAPI(title="Super Media Downloader API")
 
 class URLRequest(BaseModel):
     url: str
 
+@app.get("/")
+async def root():
+    return {"status": "online", "message": "API is live. Use /api/download"}
+
 @app.post("/api/download")
 async def download_media(request: URLRequest):
     url = request.url
     
-    # Configure yt-dlp to extract data without downloading the file locally
+    # Path to cookies file (explained in Step 2)
+    cookie_path = "cookies.txt"
+    
     ydl_opts = {
-        'format': 'best', # Gets the best quality video/audio combined
         'quiet': True,
         'no_warnings': True,
-        'extract_flat': False,
+        'format': 'best',
+        # Bypass blocks with headers
+        'http_headers': {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+            'Accept': '*/*',
+            'Accept-Language': 'en-US,en;q=0.5',
+            'Origin': 'https://www.instagram.com',
+            'Referer': 'https://www.instagram.com/',
+        }
     }
+
+    # If you uploaded a cookies.txt, use it automatically
+    if os.path.exists(cookie_path):
+        ydl_opts['cookiefile'] = cookie_path
 
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            # Extract information from the link
             info = ydl.extract_info(url, download=False)
             
-            # Prepare the response payload
-            response_data = {
-                "title": info.get('title', 'Unknown Title'),
-                "platform": info.get('extractor_key', 'Unknown'),
-                "thumbnail": info.get('thumbnail'),
-                "description": info.get('description'),
-                "duration": info.get('duration'),
-                "media": {}
-            }
-
-            # Get the direct video URL (MP4)
-            if 'url' in info:
-                response_data["media"]["video_url"] = info['url']
+            # 1. Get the Best Video URL
+            video_url = info.get('url')
             
-            # Extract Audio (MP3) URL if available in the formats
-            # Note: Many platforms mix audio and video. This looks for the best audio stream.
+            # 2. Extract the Best Audio URL (MP3)
+            # We look for the best quality audio-only stream
             formats = info.get('formats', [])
             audio_url = None
-            for f in formats:
-                if f.get('acodec') != 'none' and f.get('vcodec') == 'none':
-                    audio_url = f.get('url')
-                    break # Found an audio-only stream
             
-            if audio_url:
-                response_data["media"]["audio_mp3_url"] = audio_url
+            # Filter for audio-only streams
+            audio_streams = [f for f in formats if f.get('vcodec') == 'none' and f.get('acodec') != 'none']
+            if audio_streams:
+                # Sort by bitrate to get best quality
+                best_audio = sorted(audio_streams, key=lambda x: x.get('abr', 0), reverse=True)[0]
+                audio_url = best_audio.get('url')
             else:
-                response_data["media"]["audio_mp3_url"] = "Audio extraction not supported for this specific link format."
+                # Fallback to the main URL if no separate audio found
+                audio_url = video_url
 
             return {
                 "success": True,
-                "data": response_data
+                "data": {
+                    "title": info.get('title', 'Media'),
+                    "platform": info.get('extractor_key'),
+                    "thumbnail": info.get('thumbnail'),
+                    "video_url": video_url,
+                    "audio_url": audio_url
+                }
             }
 
-    except yt_dlp.utils.DownloadError as e:
-        raise HTTPException(status_code=400, detail=f"Could not extract media: {str(e)}")
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Server error: {str(e)}")
-
-# To run this server, use the command:
-# uvicorn main:app --reload
-
+        # Better error reporting
+        error_str = str(e)
+        if "login" in error_str.lower() or "empty media" in error_str.lower():
+            raise HTTPException(status_code=403, detail="Instagram login required. Please update cookies.txt.")
+        raise HTTPException(status_code=400, detail=error_str)
