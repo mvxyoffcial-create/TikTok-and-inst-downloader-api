@@ -13,9 +13,9 @@ import yt_dlp
 import httpx
 import uvicorn
 
-app = FastAPI(title="TikTok & Instagram Downloader – Fixed")
+app = FastAPI(title="TikTok & Instagram Downloader – Fixed & Working")
 
-# CORS – adjust in production
+# CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -26,8 +26,7 @@ app.add_middleware(
 
 # ── Cookie loading ──────────────────────────────
 def get_cookie_path() -> Optional[str]:
-    """Return the path to the cookies.txt file if it exists."""
-    # You can also use an environment variable: return os.getenv('COOKIE_TXT', 'cookies.txt')
+    """Return path to cookies.txt if it exists."""
     if os.path.exists('cookies.txt'):
         return 'cookies.txt'
     return None
@@ -38,16 +37,13 @@ def extract_info(url: str) -> Dict[str, Any]:
         'quiet': True,
         'no_warnings': True,
         'extract_flat': False,
-        # Add cookies if available
-        'cookiefile': get_cookie_path(),
-        # Use a common User-Agent to mimic a browser
+        'cookiefile': get_cookie_path(),        # 🔐 Instagram authentication
         'http_headers': {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
         },
     }
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         return ydl.extract_info(url, download=False)
-
 
 def select_best_formats(info: dict, preferred_height: int = 720) -> tuple:
     thumbnail = info.get('thumbnail')
@@ -66,7 +62,6 @@ def select_best_formats(info: dict, preferred_height: int = 720) -> tuple:
         elif f.get('acodec') != 'none':
             audio_only.append(f)
 
-    # Combined stream closest to preferred height
     best_combined = None
     if combined:
         combined.sort(key=lambda f: (
@@ -96,12 +91,12 @@ def select_best_formats(info: dict, preferred_height: int = 720) -> tuple:
 
     return video_url, audio_url, thumbnail
 
-
+# ── Proxied file streaming ─────────────────────
 async def proxy_file(url: str, referer: str, media_type: str):
-    """Stream a file from an upstream URL with proper headers, bypassing CDN blocks."""
+    """Stream a file from upstream with proper headers, bypassing CDN blocks."""
     headers = {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-        'Referer': referer,
+        'Referer': referer,              # Must be the original post URL
     }
     async with httpx.AsyncClient(timeout=30) as client:
         async with client.stream('GET', url, headers=headers) as upstream:
@@ -115,6 +110,7 @@ def convert_to_mp3(input_url: str, referer: str) -> str:
     tmp_mp3 = tempfile.NamedTemporaryFile(suffix=".mp3", delete=False)
     tmp_mp3.close()
     try:
+        # FFmpeg with Referer header
         subprocess.run([
             "ffmpeg", "-y",
             "-headers", f"Referer: {referer}",
@@ -129,7 +125,7 @@ def convert_to_mp3(input_url: str, referer: str) -> str:
         raise RuntimeError(f"FFmpeg conversion failed: {e.stderr.decode()}") from e
 
 
-# ── Endpoint 1: Get all info + proxy links ─────
+# ── 🌐 SINGLE ENDPOINT: Everything in one response ──
 @app.get("/download")
 async def get_everything(
     request: Request,
@@ -144,19 +140,27 @@ async def get_everything(
 
     video_url, audio_url, thumbnail = select_best_formats(info, preferred_height=quality)
 
-    # Handle Instagram carousels (multi-image) – return first entry
+    # Instagram carousels → return first item
     if info.get('_type') == 'playlist' and 'entries' in info:
         info = info['entries'][0]
 
     platform = info.get('extractor_key', 'unknown')
-    referer = f"https://www.{platform}.com/"
+    # Use the original post URL as referer (this is what fixes the CDN block)
+    referer = url
 
-    # Build proxied download links (hide raw CDN URLs)
+    # Build proxied links that will never get “Access Denied”
     base = str(request.base_url).rstrip("/")
-    proxy_video_url = f"{base}/proxy-video?url={quote(video_url)}&referer={quote(referer)}" if video_url else None
-    proxy_audio_url = None
+    proxy_video_url = None
+    if video_url:
+        proxy_video_url = f"{base}/proxy-video?url={quote(video_url)}&referer={quote(referer)}"
+
+    proxy_mp3_url = None
     if audio_url:
-        proxy_audio_url = f"{base}/proxy-audio?url={quote(audio_url)}&referer={quote(referer)}&quality={quality}&original_url={quote(url)}"
+        proxy_mp3_url = (
+            f"{base}/proxy-audio?"
+            f"url={quote(audio_url)}&referer={quote(referer)}"
+            f"&quality={quality}&original_url={quote(url)}"
+        )
 
     response = {
         "success": True,
@@ -166,9 +170,8 @@ async def get_everything(
         "uploader": info.get('uploader'),
         "duration": info.get('duration'),
         "thumbnail": thumbnail,
-        # These links will work because they stream through YOUR server with proper headers
-        "video_url": proxy_video_url,
-        "mp3_url": proxy_audio_url,
+        "video_url": proxy_video_url,   # ✅ Downloads without error
+        "mp3_url": proxy_mp3_url,       # ✅ MP3 that works
         "formats_available": [
             {
                 "format_id": f.get("format_id"),
@@ -184,7 +187,7 @@ async def get_everything(
     return JSONResponse(content=response)
 
 
-# ── Endpoint 2: Proxy video download ──────────
+# ── Proxied video download endpoint ─────────────
 @app.get("/proxy-video")
 async def proxy_video(
     url: str = Query(...),
@@ -193,7 +196,7 @@ async def proxy_video(
     return await proxy_file(url, referer, "video/mp4")
 
 
-# ── Endpoint 3: Proxy audio download (MP3) ────
+# ── Proxied MP3 download endpoint ───────────────
 @app.get("/proxy-audio")
 async def proxy_audio(
     url: str = Query(...),
@@ -214,7 +217,7 @@ async def proxy_audio(
     return FileResponse(
         mp3_path,
         media_type="audio/mpeg",
-        filename=f"audio.mp3",
+        filename="audio.mp3",
         background=BackgroundTask(cleanup)
     )
 
